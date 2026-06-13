@@ -153,7 +153,11 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
     };
 
     const updateFilesState = () => {
-      setFiles({ ...Object.fromEntries(fileStatesRef.current.entries()) });
+      const newFiles: Record<string, FileTransferState> = {};
+      for (const [id, state] of fileStatesRef.current.entries()) {
+        newFiles[id] = { ...state };
+      }
+      setFiles(newFiles);
     };
 
     const recomputeStatus = () => {
