@@ -92,25 +92,32 @@ export class ChunkStore {
     this.received.add(index);
   }
 
-  /** Closes the underlying stream and returns the complete file as a Blob. */
-  async getBlob(mime: string): Promise<Blob> {
-    if (this.backend === "opfs" && this.opfsHandle) {
-      if (this.opfsWritable) {
-        await this.writeQueue;
-        await this.opfsWritable.close();
-        this.opfsWritable = null;
-      }
-      return await this.opfsHandle.getFile();
+  /** Closes the underlying stream and triggers a browser download of the full file. */
+  async finalize(fileName: string, mime: string): Promise<void> {
+    let blob: Blob;
+
+    if (this.backend === "opfs" && this.opfsWritable && this.opfsHandle) {
+      await this.writeQueue;
+      await this.opfsWritable.close();
+      blob = await this.opfsHandle.getFile();
     } else if (this.db) {
       const parts: ArrayBuffer[] = [];
       for (let i = 0; i < this.totalChunks; i++) {
         const chunk = await idbGet(this.db, `${this.fileId}:${i}`);
         if (chunk) parts.push(chunk);
       }
-      return new Blob(parts, { type: mime });
+      blob = new Blob(parts, { type: mime });
     } else {
       throw new Error("ChunkStore has no active backend");
     }
+
+    downloadBlob(new Blob([blob], { type: mime }), fileName);
+    
+    // Give the browser's download manager plenty of time to stream the file 
+    // from OPFS/memory to the user's Downloads folder before deleting it.
+    setTimeout(() => {
+      this.cleanup().catch(() => {});
+    }, 5 * 60 * 1000);
   }
 
   /** Removes any temporary storage used during the transfer. */
