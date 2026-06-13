@@ -72,6 +72,7 @@ export interface UseP2PResult {
   peers: PeerStatus[];
   files: Record<string, FileTransferState>;
   addFile: (file: File) => void;
+  downloadFile: (fileId: string) => Promise<void>;
   error: string | null;
 }
 
@@ -111,6 +112,20 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
   
   const lastHaveBroadcastRef = useRef(0);
   const wasConnectedRef = useRef(false);
+
+  const downloadFileRef = useRef(async (fileId: string) => {
+    const state = fileStatesRef.current.get(fileId);
+    const store = chunkStoresRef.current.get(fileId);
+    if (!state || !store) return;
+    try {
+      const { downloadBlob } = await import("@/lib/storage");
+      const blob = await store.getBlob(state.meta.mime);
+      downloadBlob(blob, state.meta.name);
+    } catch (e) {
+      console.error("Failed to download file", e);
+      toast.error("Failed to download the file.");
+    }
+  });
 
   useEffect(() => {
     if (!encryptionKey) {
@@ -310,12 +325,12 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
       try {
         const store = chunkStoresRef.current.get(fileId);
         if (store) {
-          await store.finalize(state.meta.name, state.meta.mime);
-          toast.success(`"${state.meta.name}" downloaded successfully.`);
+          // just close the stream and make sure it's ready
+          await store.getBlob(state.meta.mime);
+          toast.success(`"${state.meta.name}" received successfully.`);
         }
       } catch (e) {
-        console.error("Failed to finalize download", e);
-        toast.error(`Transfer finished but saving "${state.meta.name}" failed.`);
+        console.error("Failed to finish receiving", e);
       }
 
       for (const entry of currentPeers.values()) {
@@ -690,6 +705,8 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
 
     const interval = setInterval(tick, TICK_INTERVAL_MS);
 
+    const currentChunkStores = chunkStoresRef.current;
+
     return () => {
       cancelled = true;
       clearInterval(interval);
@@ -706,6 +723,12 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
         }
       }
       currentPeers.clear();
+      
+      // cleanup stores
+      for (const store of currentChunkStores.values()) {
+        store.cleanup().catch(() => {});
+      }
+      currentChunkStores.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, encryptionKey]); // Intentionally omitting initialFile so it only runs once
@@ -715,6 +738,7 @@ export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): U
     peers,
     files,
     addFile: (f: File) => addFileRef.current(f),
+    downloadFile: (fileId: string) => downloadFileRef.current(fileId),
     error,
   };
 }

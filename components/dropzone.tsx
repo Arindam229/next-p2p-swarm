@@ -131,7 +131,7 @@ export function Dropzone() {
         <p className="text-sm text-muted-foreground">
           {isPreparing
             ? "Generating your private room and copying the link"
-            : "or click to browse - nothing is uploaded to a server"}
+            : "or click to browse - completely private"}
         </p>
       </div>
 

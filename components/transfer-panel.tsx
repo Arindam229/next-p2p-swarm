@@ -1,5 +1,6 @@
 "use client";
 
+import * as React from "react";
 import { motion } from "framer-motion";
 import { useCallback, useRef } from "react";
 import {
@@ -42,28 +43,37 @@ interface TransferPanelProps {
   shareLink: string;
 }
 
-function FileCard({ state }: { state: FileTransferState }) {
+function FileCard({ state, onDownload }: { state: FileTransferState; onDownload: (id: string) => void }) {
   const { meta, progress, speedBps, etaSeconds, isPaused, isComplete, error, role } = state;
-  // eslint-disable-next-line react-hooks/static-components
-  const Icon = fileIconFor(meta.mime);
   const verifiedChunks = Math.round((progress / 100) * meta.totalChunks);
 
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center gap-3">
-          <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted/60 text-emerald-400">
-            <Icon className="size-5" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <CardTitle className="truncate">{meta.name}</CardTitle>
-              <Badge variant="outline" className="text-[10px] uppercase h-5 font-mono">
-                {role === "sender" ? "Sending" : "Receiving"}
-              </Badge>
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted/60 text-emerald-400">
+              {React.createElement(fileIconFor(meta.mime), { className: "size-5" })}
             </div>
-            <CardDescription>{formatBytes(meta.size)}</CardDescription>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <CardTitle className="truncate">{meta.name}</CardTitle>
+                <Badge variant="outline" className="text-[10px] uppercase h-5 font-mono">
+                  {role === "sender" ? "Sending" : "Receiving"}
+                </Badge>
+              </div>
+              <CardDescription>{formatBytes(meta.size)}</CardDescription>
+            </div>
           </div>
+          {isComplete && role === "receiver" && (
+            <button
+              onClick={() => onDownload(meta.id)}
+              className="flex shrink-0 items-center gap-1.5 rounded-md bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
+            >
+              <Download className="size-4" />
+              Save
+            </button>
+          )}
         </div>
       </CardHeader>
 
@@ -150,7 +160,7 @@ export function TransferPanel({ result, shareLink }: TransferPanelProps) {
       ) : (
         <div className="flex flex-col gap-4">
           {fileEntries.map((state) => (
-            <FileCard key={state.meta.id} state={state} />
+            <FileCard key={state.meta.id} state={state} onDownload={result.downloadFile} />
           ))}
         </div>
       )}

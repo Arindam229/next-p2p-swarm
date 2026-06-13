@@ -2,6 +2,7 @@ import { Lock, Network, HardDrive, RefreshCw } from "lucide-react";
 import { GridBackground } from "@/components/grid-background";
 import { Dropzone } from "@/components/dropzone";
 import { Badge } from "@/components/ui/badge";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 const features = [
   {
@@ -42,10 +43,13 @@ export default function Home() {
           </span>
           P2P Web Share
         </div>
-        <Badge variant="outline" className="gap-1.5 text-muted-foreground">
-          <span className="size-1.5 rounded-full bg-emerald-400" />
-          No servers. No storage. Just peers.
-        </Badge>
+        <div className="flex items-center gap-3">
+          <ThemeToggle />
+          <Badge variant="outline" className="gap-1.5 text-muted-foreground hidden sm:inline-flex">
+            <span className="size-1.5 rounded-full bg-emerald-400" />
+            Secure. Private. Fast.
+          </Badge>
+        </div>
       </header>
 
       <main className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col items-center px-6 pb-24 pt-12 sm:pt-20">
@@ -58,8 +62,7 @@ export default function Home() {
           </h1>
           <p className="mt-4 text-balance text-base text-muted-foreground sm:text-lg">
             Drop a file, get a private link, and stream it directly to whoever
-            opens it - encrypted end-to-end, with no file ever touching a
-            server.
+            opens it - encrypted end-to-end for your privacy.
           </p>
         </div>
 
@@ -84,7 +87,7 @@ export default function Home() {
       </main>
 
       <footer className="relative z-10 border-t border-border/60 py-6 text-center text-xs text-muted-foreground">
-        Built with Next.js, WebRTC &amp; the Web Crypto API. Your files never touch our server.
+        Built with Next.js, WebRTC &amp; the Web Crypto API. Designed with privacy in mind.
       </footer>
     </div>
   );

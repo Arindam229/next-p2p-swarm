@@ -11,6 +11,8 @@ import { TransferPanel } from "@/components/transfer-panel";
 import { useP2P } from "@/hooks/useP2P";
 import { takePendingShare } from "@/lib/transfer-store";
 
+import { ThemeToggle } from "@/components/theme-toggle";
+
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
   const roomId = params.id;
@@ -24,7 +26,6 @@ export default function RoomPage() {
     const hash = window.location.hash.replace(/^#/, "");
     const key = new URLSearchParams(hash).get("key");
 
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEncryptionKey(key);
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setShareLink(`${window.location.origin}/room/${roomId}${key ? `#key=${key}` : ""}`);
@@ -41,7 +42,7 @@ export default function RoomPage() {
     <div className="relative flex flex-1 flex-col">
       <GridBackground />
 
-      <header className="relative z-10 mx-auto flex w-full max-w-2xl items-center px-6 py-6">
+      <header className="relative z-10 mx-auto flex w-full max-w-2xl items-center justify-between px-6 py-6">
         <Link
           href="/"
           className="flex items-center gap-2 text-sm font-semibold tracking-tight text-foreground transition-colors hover:text-emerald-400"
@@ -52,6 +53,7 @@ export default function RoomPage() {
           </span>
           P2P Web Share
         </Link>
+        <ThemeToggle />
       </header>
 
       <main className="relative z-10 mx-auto flex w-full max-w-2xl flex-1 flex-col px-6 pb-24 pt-4">
