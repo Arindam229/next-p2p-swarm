@@ -489,6 +489,8 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       destroyPeer(id);
     };
 
+    const joinRoom = () => socket.emit("join-room", roomId);
+
     (async () => {
       try {
         aesKeyRef.current = await importKeyFromString(encryptionKey);
@@ -523,7 +525,13 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       socket.on("peer-joined", onPeerJoined);
       socket.on("signal", onSignal);
       socket.on("peer-left", onPeerLeft);
-      socket.emit("join-room", roomId);
+      socket.on("connect", joinRoom);
+      
+      if (socket.connected) {
+        joinRoom();
+      } else {
+        joinRoom();
+      }
     })();
 
     const tick = () => {
@@ -568,6 +576,7 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       socket.off("peer-joined", onPeerJoined);
       socket.off("signal", onSignal);
       socket.off("peer-left", onPeerLeft);
+      socket.off("connect", joinRoom);
       for (const entry of peersRef.current.values()) {
         try {
           entry.peer.destroy();
