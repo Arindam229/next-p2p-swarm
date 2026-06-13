@@ -112,7 +112,12 @@ export class ChunkStore {
     }
 
     downloadBlob(new Blob([blob], { type: mime }), fileName);
-    await this.cleanup();
+    
+    // Give the browser's download manager plenty of time to stream the file 
+    // from OPFS/memory to the user's Downloads folder before deleting it.
+    setTimeout(() => {
+      this.cleanup().catch(() => {});
+    }, 5 * 60 * 1000);
   }
 
   /** Removes any temporary storage used during the transfer. */
@@ -140,7 +145,7 @@ export function downloadBlob(blob: Blob, fileName: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
 }
 
 function openDatabase(): Promise<IDBDatabase> {

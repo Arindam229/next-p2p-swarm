@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import SimplePeer from "simple-peer";
 import { toast } from "sonner";
+import { v4 as uuidv4 } from "uuid";
 
 import "@/lib/polyfills";
 import { getSocket } from "@/lib/socket";
@@ -41,31 +42,36 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 
+export interface FileTransferState {
+  meta: FileMeta;
+  progress: number;
+  speedBps: number;
+  etaSeconds: number | null;
+  isPaused: boolean;
+  isComplete: boolean;
+  error: string | null;
+  role: TransferRole;
+}
+
 interface PeerEntry {
   id: string;
   peer: SimplePeer.Instance;
   connected: boolean;
-  chunksAvailable: Set<number>;
+  chunksAvailable: Map<string, Set<number>>;
 }
 
 export interface UseP2POptions {
   roomId: string;
-  /** Present only on the browser tab that originated the share. */
-  file?: File | null;
+  initialFile?: File | null;
   /** Base64url AES-GCM key, read from the URL `#key=` fragment. */
   encryptionKey: string | null;
 }
 
 export interface UseP2PResult {
   status: ConnectionStatus;
-  role: TransferRole;
   peers: PeerStatus[];
-  fileMeta: FileMeta | null;
-  progress: number;
-  speedBps: number;
-  etaSeconds: number | null;
-  isPaused: boolean;
-  isComplete: boolean;
+  files: Record<string, FileTransferState>;
+  addFile: (file: File) => void;
   error: string | null;
 }
 
@@ -81,69 +87,78 @@ function toUint8Array(data: unknown): Uint8Array {
   throw new Error("Unsupported data-channel payload type");
 }
 
-export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PResult {
+export function useP2P({ roomId, initialFile, encryptionKey }: UseP2POptions): UseP2PResult {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  const [role, setRole] = useState<TransferRole>(file ? "sender" : "idle");
   const [peers, setPeers] = useState<PeerStatus[]>([]);
-  const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [speedBps, setSpeedBps] = useState(0);
-  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
-  const [isPaused, setIsPaused] = useState(false);
-  const [isComplete, setIsComplete] = useState(false);
+  const [files, setFiles] = useState<Record<string, FileTransferState>>({});
   const [error, setError] = useState<string | null>(null);
 
-  // Refs hold the "live" mutable state that the socket/peer event handlers
-  // close over. React state above is just a periodically-synced projection
-  // for rendering.
-  const fileRef = useRef<File | null>(file ?? null);
-  const roleRef = useRef<TransferRole>(file ? "sender" : "idle");
+  const addFileRef = useRef<(f: File) => void>(() => {});
+  const initialFileAddedRef = useRef(false);
+
   const aesKeyRef = useRef<CryptoKey | null>(null);
-  const fileMetaRef = useRef<FileMeta | null>(null);
   const peersRef = useRef<Map<string, PeerEntry>>(new Map());
-  const chunkStoreRef = useRef<ChunkStore | null>(null);
-  const chunkStorePromiseRef = useRef<Promise<ChunkStore> | null>(null);
-  const myChunksRef = useRef<Set<number>>(new Set());
-  const sentChunksRef = useRef<Set<number>>(new Set());
-  const inFlightRef = useRef<Map<number, { peerId: string; at: number }>>(new Map());
-  const pendingHaveRef = useRef<Set<number>>(new Set());
+  
+  const filesRef = useRef<Map<string, File>>(new Map());
+  const fileStatesRef = useRef<Map<string, FileTransferState>>(new Map());
+  const chunkStoresRef = useRef<Map<string, ChunkStore>>(new Map());
+  const chunkStorePromisesRef = useRef<Map<string, Promise<ChunkStore>>>(new Map());
+  const myChunksRef = useRef<Map<string, Set<number>>>(new Map());
+  const sentChunksRef = useRef<Map<string, Set<number>>>(new Map());
+  const inFlightRef = useRef<Map<string, Map<number, { peerId: string; at: number }>>>(new Map());
+  const pendingHaveRef = useRef<Map<string, Set<number>>>(new Map());
+  const bytesWindowRef = useRef<Map<string, { time: number; bytes: number }[]>>(new Map());
+  
   const lastHaveBroadcastRef = useRef(0);
-  const bytesWindowRef = useRef<{ time: number; bytes: number }[]>([]);
   const wasConnectedRef = useRef(false);
-  const isCompleteRef = useRef(false);
 
   useEffect(() => {
-    fileRef.current = file ?? null;
-
     if (!encryptionKey) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setError("Missing decryption key in the URL. Use the full share link.");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setStatus("disconnected");
       return;
     }
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStatus("connecting");
 
     let cancelled = false;
     const socket = getSocket();
-    const frameCacheRef = { current: new Map<number, Uint8Array>() };
+    const frameCacheRef = { current: new Map<string, Map<number, Uint8Array>>() };
+    const currentPeers = peersRef.current;
 
     const updatePeersState = () => {
       setPeers(
-        [...peersRef.current.values()].map((p) => ({ id: p.id, connected: p.connected }))
+        [...currentPeers.values()].map((p) => ({ id: p.id, connected: p.connected }))
       );
     };
 
+    const updateFilesState = () => {
+      setFiles({ ...Object.fromEntries(fileStatesRef.current.entries()) });
+    };
+
     const recomputeStatus = () => {
-      const connected = [...peersRef.current.values()].filter((p) => p.connected);
-      if (isCompleteRef.current) {
+      const connected = [...currentPeers.values()].filter((p) => p.connected);
+      
+      let allComplete = true;
+      let hasAnyFiles = false;
+      for (const state of fileStatesRef.current.values()) {
+        hasAnyFiles = true;
+        if (!state.isComplete) allComplete = false;
+      }
+
+      if (hasAnyFiles && allComplete) {
         setStatus("connected");
       } else if (connected.length === 0) {
-        setStatus(peersRef.current.size === 0 && wasConnectedRef.current === false ? "connecting" : "disconnected");
+        setStatus(currentPeers.size === 0 && wasConnectedRef.current === false ? "connecting" : "disconnected");
       } else if (connected.length >= 2) {
         setStatus("swarm");
         wasConnectedRef.current = true;
-      } else if (!fileMetaRef.current) {
+      } else if (!hasAnyFiles) {
         setStatus("syncing");
         wasConnectedRef.current = true;
       } else {
@@ -156,134 +171,209 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       try {
         entry.peer.send(encodeControlMessage(msg));
       } catch {
-        // Channel not open yet or already closed - safe to ignore.
+        // Channel not open yet or already closed
       }
+    };
+
+    addFileRef.current = (f: File) => {
+      const fileId = uuidv4();
+      const totalChunks = Math.max(1, Math.ceil(f.size / CHUNK_SIZE));
+      const meta: FileMeta = {
+        id: fileId,
+        name: f.name,
+        size: f.size,
+        mime: f.type || "application/octet-stream",
+        chunkSize: CHUNK_SIZE,
+        totalChunks,
+      };
+
+      filesRef.current.set(fileId, f);
+      
+      const newState: FileTransferState = {
+        meta,
+        progress: 0,
+        speedBps: 0,
+        etaSeconds: null,
+        isPaused: false,
+        isComplete: false,
+        error: null,
+        role: "sender"
+      };
+      
+      fileStatesRef.current.set(fileId, newState);
+      myChunksRef.current.set(fileId, fullSet(totalChunks));
+      sentChunksRef.current.set(fileId, new Set());
+      inFlightRef.current.set(fileId, new Map());
+      pendingHaveRef.current.set(fileId, new Set());
+      bytesWindowRef.current.set(fileId, []);
+      
+      updateFilesState();
+      
+      for (const entry of currentPeers.values()) {
+        if (entry.connected) {
+          sendControl(entry, { type: "file-meta", meta });
+          sendControl(entry, { type: "have-chunks", fileId, indices: [...fullSet(totalChunks)] });
+        }
+      }
+      recomputeStatus();
     };
 
     const flushHaveChunks = (force: boolean) => {
       const now = performance.now();
       if (!force && now - lastHaveBroadcastRef.current < HAVE_CHUNKS_THROTTLE_MS) return;
-      if (pendingHaveRef.current.size === 0) return;
-      const meta = fileMetaRef.current;
-      if (!meta) return;
-
-      lastHaveBroadcastRef.current = now;
-      const indices = [...pendingHaveRef.current];
-      pendingHaveRef.current.clear();
-      for (const entry of peersRef.current.values()) {
-        if (entry.connected) {
-          sendControl(entry, { type: "have-chunks", fileId: meta.id, indices });
+      
+      let sentAny = false;
+      for (const [fileId, pending] of pendingHaveRef.current.entries()) {
+        if (pending.size === 0) continue;
+        const indices = [...pending];
+        pending.clear();
+        sentAny = true;
+        for (const entry of currentPeers.values()) {
+          if (entry.connected) {
+            sendControl(entry, { type: "have-chunks", fileId, indices });
+          }
         }
+      }
+      if (sentAny) {
+        lastHaveBroadcastRef.current = now;
       }
     };
 
     const scheduleRequests = () => {
-      const meta = fileMetaRef.current;
-      if (!meta || roleRef.current !== "receiver") return;
-
       const now = performance.now();
-      for (const [index, info] of inFlightRef.current) {
-        if (now - info.at > IN_FLIGHT_TIMEOUT_MS) inFlightRef.current.delete(index);
-      }
+      const connectedPeers = [...currentPeers.values()].filter((p) => p.connected);
+      let updated = false;
 
-      const connectedPeers = [...peersRef.current.values()].filter((p) => p.connected);
-      if (connectedPeers.length === 0) {
-        if (myChunksRef.current.size < meta.totalChunks && !isCompleteRef.current) {
-          setIsPaused(true);
+      for (const [fileId, state] of fileStatesRef.current.entries()) {
+        if (state.role !== "receiver") continue;
+        const meta = state.meta;
+        const inFlight = inFlightRef.current.get(fileId)!;
+        const myChunks = myChunksRef.current.get(fileId)!;
+        
+        for (const [index, info] of inFlight) {
+          if (now - info.at > IN_FLIGHT_TIMEOUT_MS) inFlight.delete(index);
         }
-        return;
-      }
-      setIsPaused(false);
 
-      for (const entry of connectedPeers) {
-        let inFlightForPeer = 0;
-        for (const info of inFlightRef.current.values()) {
-          if (info.peerId === entry.id) inFlightForPeer++;
+        if (connectedPeers.length === 0) {
+          if (myChunks.size < meta.totalChunks && !state.isComplete) {
+            if (!state.isPaused) {
+              state.isPaused = true;
+              updated = true;
+            }
+          }
+          continue;
         }
-        let slots = Math.min(MAX_IN_FLIGHT_PER_PEER - inFlightForPeer, REQUEST_BATCH_SIZE);
-        if (slots <= 0) continue;
 
-        const batch: number[] = [];
-        for (let i = 0; i < meta.totalChunks && slots > 0; i++) {
-          if (myChunksRef.current.has(i) || inFlightRef.current.has(i)) continue;
-          if (!entry.chunksAvailable.has(i)) continue;
-          batch.push(i);
-          inFlightRef.current.set(i, { peerId: entry.id, at: now });
-          slots--;
+        if (state.isPaused) {
+          state.isPaused = false;
+          updated = true;
         }
-        if (batch.length > 0) {
-          sendControl(entry, { type: "request-chunks", fileId: meta.id, indices: batch });
+
+        for (const entry of connectedPeers) {
+          let inFlightForPeer = 0;
+          for (const info of inFlight.values()) {
+            if (info.peerId === entry.id) inFlightForPeer++;
+          }
+          let slots = Math.min(MAX_IN_FLIGHT_PER_PEER - inFlightForPeer, REQUEST_BATCH_SIZE);
+          if (slots <= 0) continue;
+
+          const batch: number[] = [];
+          const peerChunks = entry.chunksAvailable.get(fileId);
+          if (!peerChunks) continue;
+          
+          for (let i = 0; i < meta.totalChunks && slots > 0; i++) {
+            if (myChunks.has(i) || inFlight.has(i)) continue;
+            if (!peerChunks.has(i)) continue;
+            batch.push(i);
+            inFlight.set(i, { peerId: entry.id, at: now });
+            slots--;
+          }
+          if (batch.length > 0) {
+            sendControl(entry, { type: "request-chunks", fileId, indices: batch });
+          }
         }
       }
+      
+      if (updated) updateFilesState();
     };
 
-    const completeTransfer = async () => {
-      const meta = fileMetaRef.current;
-      if (!meta || isCompleteRef.current) return;
-      isCompleteRef.current = true;
-      setIsComplete(true);
-      setProgress(100);
-      setEtaSeconds(0);
-      setIsPaused(false);
+    const completeTransfer = async (fileId: string) => {
+      const state = fileStatesRef.current.get(fileId);
+      if (!state || state.isComplete) return;
+      
+      state.isComplete = true;
+      state.progress = 100;
+      state.etaSeconds = 0;
+      state.isPaused = false;
+      updateFilesState();
 
       try {
-        await chunkStoreRef.current?.finalize(meta.name, meta.mime);
-        toast.success(`"${meta.name}" downloaded successfully.`);
+        const store = chunkStoresRef.current.get(fileId);
+        if (store) {
+          await store.finalize(state.meta.name, state.meta.mime);
+          toast.success(`"${state.meta.name}" downloaded successfully.`);
+        }
       } catch (e) {
         console.error("Failed to finalize download", e);
-        toast.error("Transfer finished but saving the file failed.");
+        toast.error(`Transfer finished but saving "${state.meta.name}" failed.`);
       }
 
-      for (const entry of peersRef.current.values()) {
+      for (const entry of currentPeers.values()) {
         if (entry.connected) {
-          sendControl(entry, { type: "transfer-complete", fileId: meta.id });
+          sendControl(entry, { type: "transfer-complete", fileId });
         }
       }
       recomputeStatus();
     };
 
     const ensureChunkStore = (meta: FileMeta) => {
-      if (chunkStoreRef.current || chunkStorePromiseRef.current) return;
-      chunkStorePromiseRef.current = ChunkStore.create({
+      let promise = chunkStorePromisesRef.current.get(meta.id);
+      if (promise) return promise;
+      
+      promise = ChunkStore.create({
         fileId: meta.id,
         chunkSize: meta.chunkSize,
         totalChunks: meta.totalChunks,
       }).then((store) => {
-        chunkStoreRef.current = store;
+        chunkStoresRef.current.set(meta.id, store);
         return store;
       });
+      chunkStorePromisesRef.current.set(meta.id, promise);
+      return promise;
     };
 
-    const serveChunkRequest = async (entry: PeerEntry, indices: number[]) => {
-      const meta = fileMetaRef.current;
+    const serveChunkRequest = async (entry: PeerEntry, fileId: string, indices: number[]) => {
+      const state = fileStatesRef.current.get(fileId);
       const key = aesKeyRef.current;
-      if (!meta || !key) return;
+      if (!state || !key) return;
+      const meta = state.meta;
 
       for (const index of indices) {
-        if (roleRef.current === "sender" && fileRef.current) {
+        if (state.role === "sender") {
+          const file = filesRef.current.get(fileId);
+          if (!file) continue;
           const start = index * meta.chunkSize;
           const end = Math.min(start + meta.chunkSize, meta.size);
           try {
-            const buf = await fileRef.current.slice(start, end).arrayBuffer();
+            const buf = await file.slice(start, end).arrayBuffer();
             const hash = await sha256Bytes(buf);
             const { iv, ciphertext } = await encryptChunk(key, buf);
-            const frame = encodeChunkFrame(index, iv, hash, ciphertext);
+            const frame = encodeChunkFrame(fileId, index, iv, hash, ciphertext);
             entry.peer.send(frame);
-            if (!sentChunksRef.current.has(index)) {
-              sentChunksRef.current.add(index);
-            }
+            const sent = sentChunksRef.current.get(fileId)!;
+            if (!sent.has(index)) sent.add(index);
           } catch (e) {
             console.error("Failed to read/encrypt chunk", index, e);
           }
         } else {
-          // Swarm relay: forward the exact frame we previously verified,
-          // no decrypt/re-encrypt needed.
-          const cached = frameCacheRef.current.get(index);
+          const fileCache = frameCacheRef.current.get(fileId);
+          if (!fileCache) continue;
+          const cached = fileCache.get(index);
           if (cached) {
             try {
               entry.peer.send(cached);
             } catch {
-              // ignore - requester will time out and re-request elsewhere
+              // ignore
             }
           }
         }
@@ -293,30 +383,45 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
     const handleControlMessage = (entry: PeerEntry, msg: ControlMessage) => {
       switch (msg.type) {
         case "file-meta": {
-          if (!fileMetaRef.current) {
-            fileMetaRef.current = msg.meta;
-            setFileMeta(msg.meta);
-            if (roleRef.current === "idle") {
-              roleRef.current = "receiver";
-              setRole("receiver");
-              ensureChunkStore(msg.meta);
-            }
+          if (!fileStatesRef.current.has(msg.meta.id)) {
+            const newState: FileTransferState = {
+              meta: msg.meta,
+              progress: 0,
+              speedBps: 0,
+              etaSeconds: null,
+              isPaused: false,
+              isComplete: false,
+              error: null,
+              role: "receiver"
+            };
+            fileStatesRef.current.set(msg.meta.id, newState);
+            myChunksRef.current.set(msg.meta.id, new Set());
+            inFlightRef.current.set(msg.meta.id, new Map());
+            pendingHaveRef.current.set(msg.meta.id, new Set());
+            bytesWindowRef.current.set(msg.meta.id, []);
+            ensureChunkStore(msg.meta);
+            updateFilesState();
           }
           recomputeStatus();
           scheduleRequests();
           break;
         }
         case "have-chunks": {
-          for (const idx of msg.indices) entry.chunksAvailable.add(idx);
+          let peerChunks = entry.chunksAvailable.get(msg.fileId);
+          if (!peerChunks) {
+            peerChunks = new Set();
+            entry.chunksAvailable.set(msg.fileId, peerChunks);
+          }
+          for (const idx of msg.indices) peerChunks.add(idx);
           scheduleRequests();
           break;
         }
         case "request-chunks": {
-          void serveChunkRequest(entry, msg.indices);
+          void serveChunkRequest(entry, msg.fileId, msg.indices);
           break;
         }
         case "transfer-complete": {
-          // Informational only - completion is driven by our own chunk count.
+          // Informational only
           break;
         }
         default:
@@ -325,45 +430,55 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
     };
 
     const handleChunkFrame = async (entry: PeerEntry, frame: ChunkFrame, raw: Uint8Array) => {
-      const meta = fileMetaRef.current;
+      const { fileId, index, iv, hash: frameHash, ciphertext } = frame;
+      const state = fileStatesRef.current.get(fileId);
       const key = aesKeyRef.current;
-      if (!meta || !key) return;
-      if (roleRef.current !== "receiver") return;
-      if (myChunksRef.current.has(frame.index)) {
-        inFlightRef.current.delete(frame.index);
+      if (!state || !key || state.role !== "receiver") return;
+      
+      const inFlight = inFlightRef.current.get(fileId)!;
+      const myChunks = myChunksRef.current.get(fileId)!;
+      
+      if (myChunks.has(index)) {
+        inFlight.delete(index);
         return;
       }
 
       try {
-        const plaintext = await decryptChunk(key, frame.iv, frame.ciphertext);
+        const plaintext = await decryptChunk(key, iv, ciphertext);
         const hash = await sha256Bytes(plaintext);
-        if (!bytesEqual(hash, frame.hash)) {
-          inFlightRef.current.delete(frame.index);
+        if (!bytesEqual(hash, frameHash)) {
+          inFlight.delete(index);
           return;
         }
 
-        await chunkStorePromiseRef.current;
-        await chunkStoreRef.current?.writeChunk(frame.index, plaintext);
+        const store = await ensureChunkStore(state.meta);
+        await store.writeChunk(index, plaintext);
 
-        frameCacheRef.current.set(frame.index, raw.slice());
-        myChunksRef.current.add(frame.index);
-        pendingHaveRef.current.add(frame.index);
-        inFlightRef.current.delete(frame.index);
-        bytesWindowRef.current.push({ time: performance.now(), bytes: plaintext.byteLength });
+        let fileCache = frameCacheRef.current.get(fileId);
+        if (!fileCache) {
+          fileCache = new Map();
+          frameCacheRef.current.set(fileId, fileCache);
+        }
+        fileCache.set(index, raw.slice());
+        
+        myChunks.add(index);
+        pendingHaveRef.current.get(fileId)!.add(index);
+        inFlight.delete(index);
+        bytesWindowRef.current.get(fileId)!.push({ time: performance.now(), bytes: plaintext.byteLength });
 
         flushHaveChunks(false);
 
-        if (myChunksRef.current.size === meta.totalChunks) {
-          await completeTransfer();
+        if (myChunks.size === state.meta.totalChunks && !state.isComplete) {
+          await completeTransfer(fileId);
         }
       } catch (e) {
         console.error("Chunk decode error", e);
-        inFlightRef.current.delete(frame.index);
+        inFlight.delete(index);
       }
     };
 
     const createPeerEntry = (id: string, initiator: boolean): PeerEntry => {
-      const existing = peersRef.current.get(id);
+      const existing = currentPeers.get(id);
       if (existing) return existing;
 
       const peer = new SimplePeer({
@@ -372,8 +487,8 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
         config: { iceServers: ICE_SERVERS },
       });
 
-      const entry: PeerEntry = { id, peer, connected: false, chunksAvailable: new Set() };
-      peersRef.current.set(id, entry);
+      const entry: PeerEntry = { id, peer, connected: false, chunksAvailable: new Map() };
+      currentPeers.set(id, entry);
 
       peer.on("signal", (signal) => {
         socket.emit("signal", { to: id, signal });
@@ -383,15 +498,17 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
         entry.connected = true;
         updatePeersState();
 
-        if (fileMetaRef.current) {
-          sendControl(entry, { type: "file-meta", meta: fileMetaRef.current });
-        }
-        if (myChunksRef.current.size > 0 && fileMetaRef.current) {
-          sendControl(entry, {
-            type: "have-chunks",
-            fileId: fileMetaRef.current.id,
-            indices: [...myChunksRef.current],
-          });
+        for (const [fileId, state] of fileStatesRef.current.entries()) {
+          sendControl(entry, { type: "file-meta", meta: state.meta });
+          
+          const myChunks = myChunksRef.current.get(fileId);
+          if (myChunks && myChunks.size > 0) {
+            sendControl(entry, {
+              type: "have-chunks",
+              fileId,
+              indices: [...myChunks],
+            });
+          }
         }
 
         if (wasConnectedRef.current) {
@@ -422,11 +539,18 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
         entry.connected = false;
         updatePeersState();
 
-        for (const [index, info] of inFlightRef.current) {
-          if (info.peerId === id) inFlightRef.current.delete(index);
+        let pausedAny = false;
+        for (const [fileId, state] of fileStatesRef.current.entries()) {
+          const inFlight = inFlightRef.current.get(fileId)!;
+          for (const [index, info] of inFlight) {
+            if (info.peerId === id) inFlight.delete(index);
+          }
+          if (!state.isComplete && state.role === "receiver") {
+            pausedAny = true;
+          }
         }
 
-        if (!isCompleteRef.current && roleRef.current === "receiver") {
+        if (pausedAny) {
           toast.warning("Peer disconnected. Pausing - will resume automatically.");
         }
 
@@ -445,7 +569,7 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
     };
 
     const destroyPeer = (id: string) => {
-      const entry = peersRef.current.get(id);
+      const entry = currentPeers.get(id);
       if (!entry) return;
       entry.connected = false;
       try {
@@ -453,14 +577,21 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       } catch {
         // ignore
       }
-      peersRef.current.delete(id);
+      currentPeers.delete(id);
 
-      for (const [index, info] of inFlightRef.current) {
-        if (info.peerId === id) inFlightRef.current.delete(index);
+      let pausedAny = false;
+      for (const [fileId, state] of fileStatesRef.current.entries()) {
+        const inFlight = inFlightRef.current.get(fileId)!;
+        for (const [index, info] of inFlight) {
+          if (info.peerId === id) inFlight.delete(index);
+        }
+        if (!state.isComplete && state.role === "receiver") {
+          pausedAny = true;
+        }
       }
 
       updatePeersState();
-      if (!isCompleteRef.current && roleRef.current === "receiver") {
+      if (pausedAny) {
         toast.warning("Peer disconnected. Pausing - will resume automatically.");
       }
       recomputeStatus();
@@ -503,22 +634,9 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       }
       if (cancelled) return;
 
-      if (fileRef.current) {
-        const f = fileRef.current;
-        const totalChunks = Math.max(1, Math.ceil(f.size / CHUNK_SIZE));
-        const meta: FileMeta = {
-          id: roomId,
-          name: f.name,
-          size: f.size,
-          mime: f.type || "application/octet-stream",
-          chunkSize: CHUNK_SIZE,
-          totalChunks,
-        };
-        fileMetaRef.current = meta;
-        setFileMeta(meta);
-        roleRef.current = "sender";
-        setRole("sender");
-        myChunksRef.current = fullSet(totalChunks);
+      if (initialFile && !initialFileAddedRef.current) {
+        initialFileAddedRef.current = true;
+        addFileRef.current(initialFile);
       }
 
       socket.on("room-peers", onRoomPeers);
@@ -536,33 +654,36 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
 
     const tick = () => {
       const now = performance.now();
-      bytesWindowRef.current = bytesWindowRef.current.filter(
-        (e) => now - e.time < SPEED_WINDOW_MS
-      );
+      let updated = false;
+      
+      for (const [fileId, state] of fileStatesRef.current.entries()) {
+        const meta = state.meta;
+        let windowArr = bytesWindowRef.current.get(fileId)!;
+        
+        windowArr = windowArr.filter((e) => now - e.time < SPEED_WINDOW_MS);
+        bytesWindowRef.current.set(fileId, windowArr);
 
-      const windowBytes = bytesWindowRef.current.reduce((s, e) => s + e.bytes, 0);
-      const span = bytesWindowRef.current.length
-        ? Math.max((now - bytesWindowRef.current[0].time) / 1000, 0.25)
-        : 1;
-      const speed = windowBytes / span;
-      setSpeedBps(speed);
+        const windowBytes = windowArr.reduce((s, e) => s + e.bytes, 0);
+        const span = windowArr.length
+          ? Math.max((now - windowArr[0].time) / 1000, 0.25)
+          : 1;
+        state.speedBps = windowBytes / span;
 
-      const meta = fileMetaRef.current;
-      if (meta) {
-        if (roleRef.current === "receiver") {
-          const done = myChunksRef.current.size;
-          const pct = (done / meta.totalChunks) * 100;
-          setProgress(pct);
-          if (!isCompleteRef.current) {
+        if (state.role === "receiver") {
+          const done = myChunksRef.current.get(fileId)!.size;
+          state.progress = (done / meta.totalChunks) * 100;
+          if (!state.isComplete) {
             const remaining = meta.size - done * meta.chunkSize;
-            setEtaSeconds(speed > 1024 ? Math.max(remaining, 0) / speed : null);
+            state.etaSeconds = state.speedBps > 1024 ? Math.max(remaining, 0) / state.speedBps : null;
           }
-        } else if (roleRef.current === "sender") {
-          const pct = (sentChunksRef.current.size / meta.totalChunks) * 100;
-          setProgress(pct);
+        } else if (state.role === "sender") {
+          const sent = sentChunksRef.current.get(fileId)!.size;
+          state.progress = (sent / meta.totalChunks) * 100;
         }
+        updated = true;
       }
 
+      if (updated) updateFilesState();
       flushHaveChunks(true);
       scheduleRequests();
     };
@@ -577,28 +698,23 @@ export function useP2P({ roomId, file, encryptionKey }: UseP2POptions): UseP2PRe
       socket.off("signal", onSignal);
       socket.off("peer-left", onPeerLeft);
       socket.off("connect", joinRoom);
-      for (const entry of peersRef.current.values()) {
+      for (const entry of currentPeers.values()) {
         try {
           entry.peer.destroy();
         } catch {
           // ignore
         }
       }
-      peersRef.current.clear();
+      currentPeers.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, encryptionKey, file]);
+  }, [roomId, encryptionKey]); // Intentionally omitting initialFile so it only runs once
 
   return {
     status,
-    role,
     peers,
-    fileMeta,
-    progress,
-    speedBps,
-    etaSeconds,
-    isPaused,
-    isComplete,
+    files,
+    addFile: (f: File) => addFileRef.current(f),
     error,
   };
 }

@@ -17,23 +17,25 @@ export default function RoomPage() {
 
   const [ready, setReady] = useState(false);
   const [encryptionKey, setEncryptionKey] = useState<string | null>(null);
-  const [file, setFile] = useState<File | null>(null);
+  const [initialFile, setInitialFile] = useState<File | null>(null);
   const [shareLink, setShareLink] = useState("");
 
   useEffect(() => {
     const hash = window.location.hash.replace(/^#/, "");
     const key = new URLSearchParams(hash).get("key");
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEncryptionKey(key);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setShareLink(`${window.location.origin}/room/${roomId}${key ? `#key=${key}` : ""}`);
 
     const pending = takePendingShare(roomId);
-    if (pending) setFile(pending.file);
+    if (pending) setInitialFile(pending.file);
 
     setReady(true);
   }, [roomId]);
 
-  const result = useP2P({ roomId, file, encryptionKey });
+  const result = useP2P({ roomId, initialFile, encryptionKey });
 
   return (
     <div className="relative flex flex-1 flex-col">
